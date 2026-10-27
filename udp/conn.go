@@ -27,7 +27,7 @@ type Settings struct {
 	Offloads bool
 
 	// ListenConfig optionally configures the underlay UDP socket before bind.
-	// Linux honors Control and ControlContext while retaining native UDP I/O.
+	// Linux honors Control while retaining native UDP I/O.
 	// A callback error aborts listener creation.
 	ListenConfig func(*net.ListenConfig)
 }

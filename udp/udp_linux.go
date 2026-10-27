@@ -3,7 +3,6 @@
 package udp
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -110,14 +109,14 @@ func configureListenSocket(fd int, s Settings) error {
 	}
 	var lc net.ListenConfig
 	s.ListenConfig(&lc)
-	raw := rawSocketConn(fd)
-	if lc.ControlContext != nil {
-		return lc.ControlContext(context.Background(), "udp", s.Listen.String(), raw)
+	if lc.Control == nil {
+		return nil
 	}
-	if lc.Control != nil {
-		return lc.Control("udp", s.Listen.String(), raw)
+	network := "udp6"
+	if s.Listen.Addr().Is4() {
+		network = "udp4"
 	}
-	return nil
+	return lc.Control(network, s.Listen.String(), rawSocketConn(fd))
 }
 
 // udpGROBufferSize sizes the per-entry recvmmsg buffer when UDP_GRO is on.

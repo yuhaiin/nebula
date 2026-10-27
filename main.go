@@ -35,9 +35,9 @@ const _ = noiseutil.RejectHeadroom - 4*maxRoutines
 // The zero value preserves the behavior of Main.
 type MainOptions struct {
 	// UDPListenConfig customizes underlay UDP socket setup. Linux applies
-	// Control or ControlContext to its native UDP socket; other platforms use
-	// net.ListenConfig directly. The callback runs for every listener, including
-	// lighthouse and relay traffic, and may run concurrently.
+	// Control to its native UDP socket; other platforms use net.ListenConfig
+	// directly. The callback runs for every listener, including lighthouse and
+	// relay traffic, and may run concurrently.
 	UDPListenConfig func(*net.ListenConfig)
 }
 
