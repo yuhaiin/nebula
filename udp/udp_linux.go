@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"os"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -32,16 +31,11 @@ type StdConn struct {
 	// udp_linux_writebatch.go.
 	bw *batchWriter
 
-	groSupported bool
-	// file owns the descriptor obtained from net.ListenConfig, when provided.
-	// Without a custom listener configuration Nebula keeps its native socket.
-	file *os.File
+	groSupported     bool
+	listenControlled bool
 }
 
 func NewListener(l *slog.Logger, s Settings) (Conn, error) {
-	if s.ListenConfig != nil {
-		return newConfiguredListener(l, s)
-	}
 	af := unix.AF_INET6
 	if s.Listen.Addr().Is4() {
 		af = unix.AF_INET
@@ -63,6 +57,11 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 		}
 	}
 
+	if err = configureListenSocket(fd, s); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("unable to configure udp listener: %w", err)
+	}
+
 	var sa unix.Sockaddr
 	port := int(s.Listen.Port())
 	if s.Listen.Addr().Is4() {
@@ -79,59 +78,8 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 		return nil, fmt.Errorf("unable to bind to socket: %w", err)
 	}
 
-	return newStdConn(l, s, fd, nil), nil
-}
+	out := &StdConn{sysFd: fd, isV4: s.Listen.Addr().Is4(), l: l, batch: s.Batch, listenControlled: s.ListenConfig != nil}
 
-// newConfiguredListener applies the caller's net.ListenConfig to socket
-// creation. We duplicate the resulting descriptor and retain Nebula's native
-// recvmmsg/sendmmsg data paths, including GSO/GRO and batch processing.
-func newConfiguredListener(l *slog.Logger, s Settings) (Conn, error) {
-	var lc net.ListenConfig
-	s.ListenConfig(&lc)
-	if s.Multi {
-		// Nebula needs SO_REUSEPORT for multiple listening routines even
-		// when the embedder supplies a custom listen configuration.
-		control := lc.Control
-		lc.Control = func(network, address string, c syscall.RawConn) error {
-			var optionErr error
-			if err := c.Control(func(fd uintptr) {
-				optionErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-			}); err != nil {
-				return err
-			}
-			if optionErr != nil {
-				return fmt.Errorf("unable to set SO_REUSEPORT: %w", optionErr)
-			}
-			if control != nil {
-				return control(network, address, c)
-			}
-			return nil
-		}
-	}
-
-	pc, err := lc.ListenPacket(context.Background(), "udp", s.Listen.String())
-	if err != nil {
-		return nil, fmt.Errorf("unable to open configured UDP listener: %w", err)
-	}
-	uc, ok := pc.(*net.UDPConn)
-	if !ok {
-		_ = pc.Close()
-		return nil, fmt.Errorf("unexpected configured UDP listener: %T", pc)
-	}
-	file, err := uc.File()
-	closeErr := uc.Close()
-	if err != nil {
-		return nil, fmt.Errorf("unable to duplicate configured UDP listener: %w", err)
-	}
-	if closeErr != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("unable to close original configured UDP listener: %w", closeErr)
-	}
-	return newStdConn(l, s, int(file.Fd()), file), nil
-}
-
-func newStdConn(l *slog.Logger, s Settings, fd int, file *os.File) *StdConn {
-	out := &StdConn{sysFd: fd, isV4: s.Listen.Addr().Is4(), l: l, batch: s.Batch, file: file}
 	out.bw = newBatchWriter(fd, out.isV4, l, s.Offloads)
 
 	// GRO coalesces same-flow datagrams into superpackets that must be split back apart via the delivered gso_size cmsg
@@ -139,7 +87,37 @@ func newStdConn(l *slog.Logger, s Settings, fd int, file *os.File) *StdConn {
 	if s.Batch > 1 && s.Offloads {
 		out.prepareGRO()
 	}
-	return out
+
+	return out, nil
+}
+
+// rawSocketConn borrows the native UDP socket descriptor for ListenConfig
+// callbacks. Only Control is supported: Nebula retains responsibility for
+// the socket's I/O and lifetime.
+type rawSocketConn uintptr
+
+func (c rawSocketConn) Control(f func(uintptr)) error {
+	f(uintptr(c))
+	return nil
+}
+
+func (rawSocketConn) Read(func(uintptr) bool) error   { return syscall.EOPNOTSUPP }
+func (rawSocketConn) Write(func(uintptr) bool) error  { return syscall.EOPNOTSUPP }
+
+func configureListenSocket(fd int, s Settings) error {
+	if s.ListenConfig == nil {
+		return nil
+	}
+	var lc net.ListenConfig
+	s.ListenConfig(&lc)
+	raw := rawSocketConn(fd)
+	if lc.ControlContext != nil {
+		return lc.ControlContext(context.Background(), "udp", s.Listen.String(), raw)
+	}
+	if lc.Control != nil {
+		return lc.Control("udp", s.Listen.String(), raw)
+	}
+	return nil
 }
 
 // udpGROBufferSize sizes the per-entry recvmmsg buffer when UDP_GRO is on.
@@ -507,9 +485,9 @@ func (u *StdConn) ReloadConfig(c *config.C, r *config.Reload) {
 		}
 	}
 
-	// Preserve a mark supplied by ListenConfig.Control if the Nebula config
-	// does not explicitly set listen.so_mark. A configured mark takes priority.
-	if u.file == nil || c.IsSet("listen.so_mark") {
+	// Preserve a routing mark set by the host's listener callback unless
+	// listen.so_mark was explicitly configured in Nebula.
+	if !u.listenControlled || c.IsSet("listen.so_mark") {
 		b = c.GetInt("listen.so_mark", 0)
 		s, err := u.GetSoMark()
 		if b > 0 || (err == nil && s != 0) {
@@ -546,9 +524,6 @@ func (u *StdConn) Shutdown() error {
 
 func (u *StdConn) Close() error {
 	_ = u.Shutdown()
-	if u.file != nil {
-		return u.file.Close()
-	}
 	return unix.Close(u.sysFd)
 }
 

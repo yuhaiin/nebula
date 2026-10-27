@@ -34,10 +34,10 @@ const _ = noiseutil.RejectHeadroom - 4*maxRoutines
 // MainOptions configures optional hooks for embedding Nebula.
 // The zero value preserves the behavior of Main.
 type MainOptions struct {
-	// UDPListenConfig customizes the underlay UDP listener using Go's standard
-	// net.ListenConfig API. It is applied independently to every UDP listener,
-	// including listeners serving lighthouse and relay traffic.
-	// The callback may run concurrently for multiple listening routines.
+	// UDPListenConfig customizes underlay UDP socket setup. Linux applies
+	// Control or ControlContext to its native UDP socket; other platforms use
+	// net.ListenConfig directly. The callback runs for every listener, including
+	// lighthouse and relay traffic, and may run concurrently.
 	UDPListenConfig func(*net.ListenConfig)
 }
 
