@@ -17,8 +17,10 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 
 func NewListenConfig(multi bool, options ...func(*net.ListenConfig)) net.ListenConfig {
 	var lc net.ListenConfig
-	if len(options) > 0 && options[0] != nil {
-		options[0](&lc)
+	for _, option := range options {
+		if option != nil {
+			option(&lc)
+		}
 	}
 	if !multi {
 		return lc
