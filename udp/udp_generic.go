@@ -29,7 +29,7 @@ type GenericConn struct {
 var _ Conn = &GenericConn{}
 
 func NewGenericListener(l *slog.Logger, s Settings) (Conn, error) {
-	lc := NewListenConfig(s.Multi)
+	lc := NewListenConfig(s.Multi, s.ListenConfig)
 	pc, err := lc.ListenPacket(context.TODO(), "udp", s.Listen.String())
 	if err != nil {
 		return nil, err

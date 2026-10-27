@@ -30,7 +30,8 @@ type StdConn struct {
 	// udp_linux_writebatch.go.
 	bw *batchWriter
 
-	groSupported bool
+	groSupported     bool
+	listenControlled bool
 }
 
 func NewListener(l *slog.Logger, s Settings) (Conn, error) {
@@ -55,6 +56,11 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 		}
 	}
 
+	if err = configureListenSocket(fd, s); err != nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("unable to configure udp listener: %w", err)
+	}
+
 	var sa unix.Sockaddr
 	port := int(s.Listen.Port())
 	if s.Listen.Addr().Is4() {
@@ -71,7 +77,7 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 		return nil, fmt.Errorf("unable to bind to socket: %w", err)
 	}
 
-	out := &StdConn{sysFd: fd, isV4: s.Listen.Addr().Is4(), l: l, batch: s.Batch}
+	out := &StdConn{sysFd: fd, isV4: s.Listen.Addr().Is4(), l: l, batch: s.Batch, listenControlled: s.ListenConfig != nil}
 
 	out.bw = newBatchWriter(fd, out.isV4, l, s.Offloads)
 
@@ -82,6 +88,35 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 	}
 
 	return out, nil
+}
+
+// rawSocketConn borrows the native UDP socket descriptor for ListenConfig
+// callbacks. Only Control is supported: Nebula retains responsibility for
+// the socket's I/O and lifetime.
+type rawSocketConn uintptr
+
+func (c rawSocketConn) Control(f func(uintptr)) error {
+	f(uintptr(c))
+	return nil
+}
+
+func (rawSocketConn) Read(func(uintptr) bool) error   { return syscall.EOPNOTSUPP }
+func (rawSocketConn) Write(func(uintptr) bool) error  { return syscall.EOPNOTSUPP }
+
+func configureListenSocket(fd int, s Settings) error {
+	if s.ListenConfig == nil {
+		return nil
+	}
+	var lc net.ListenConfig
+	s.ListenConfig(&lc)
+	if lc.Control == nil {
+		return nil
+	}
+	network := "udp6"
+	if s.Listen.Addr().Is4() {
+		network = "udp4"
+	}
+	return lc.Control(network, s.Listen.String(), rawSocketConn(fd))
 }
 
 // udpGROBufferSize sizes the per-entry recvmmsg buffer when UDP_GRO is on.
@@ -449,18 +484,22 @@ func (u *StdConn) ReloadConfig(c *config.C, r *config.Reload) {
 		}
 	}
 
-	b = c.GetInt("listen.so_mark", 0)
-	s, err := u.GetSoMark()
-	if b > 0 || (err == nil && s != 0) {
-		if err := u.SetSoMark(b); err == nil {
-			if s, err := u.GetSoMark(); err == nil {
-				u.l.Info("listen.so_mark was set", "mark", s)
+	// Preserve a routing mark set by the host's listener callback unless
+	// listen.so_mark was explicitly configured in Nebula.
+	if !u.listenControlled || c.IsSet("listen.so_mark") {
+		b = c.GetInt("listen.so_mark", 0)
+		s, err := u.GetSoMark()
+		if b > 0 || (err == nil && s != 0) {
+			if err := u.SetSoMark(b); err == nil {
+				if s, err := u.GetSoMark(); err == nil {
+					u.l.Info("listen.so_mark was set", "mark", s)
+				} else {
+					u.l.Warn("Failed to get listen.so_mark", "error", err)
+				}
 			} else {
-				u.l.Warn("Failed to get listen.so_mark", "error", err)
+				u.l.Error("Failed to set listen.so_mark", "error", err)
+				r.Failed()
 			}
-		} else {
-			u.l.Error("Failed to set listen.so_mark", "error", err)
-			r.Failed()
 		}
 	}
 }
