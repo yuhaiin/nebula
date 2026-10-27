@@ -22,19 +22,21 @@ type StdConn struct {
 	isV4  bool
 	sysFd uintptr
 	l     *slog.Logger
+	// Reconfigure the underlay when the OS drops its interface binding.
+	listenConfig func(*net.ListenConfig)
 }
 
 var _ Conn = &StdConn{}
 
 func NewListener(l *slog.Logger, s Settings) (Conn, error) {
-	lc := NewListenConfig(s.Multi)
+	lc := NewListenConfig(s.Multi, s.ListenConfig)
 	pc, err := lc.ListenPacket(context.TODO(), "udp", s.Listen.String())
 	if err != nil {
 		return nil, err
 	}
 
 	if uc, ok := pc.(*net.UDPConn); ok {
-		c := &StdConn{UDPConn: uc, l: l}
+		c := &StdConn{UDPConn: uc, l: l, listenConfig: s.ListenConfig}
 
 		rc, err := uc.SyscallConn()
 		if err != nil {
@@ -60,28 +62,32 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 	return nil, fmt.Errorf("unexpected PacketConn: %T %#v", pc, pc)
 }
 
-func NewListenConfig(multi bool) net.ListenConfig {
-	return net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			if multi {
-				var controlErr error
-				err := c.Control(func(fd uintptr) {
-					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-						controlErr = fmt.Errorf("SO_REUSEPORT failed: %v", err)
-						return
-					}
-				})
-				if err != nil {
-					return err
-				}
-				if controlErr != nil {
-					return controlErr
-				}
-			}
-
-			return nil
-		},
+func NewListenConfig(multi bool, options ...func(*net.ListenConfig)) net.ListenConfig {
+	var lc net.ListenConfig
+	if len(options) > 0 && options[0] != nil {
+		options[0](&lc)
 	}
+	if !multi {
+		return lc
+	}
+
+	control := lc.Control
+	lc.Control = func(network, address string, c syscall.RawConn) error {
+		var optionErr error
+		if err := c.Control(func(fd uintptr) {
+			optionErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		if optionErr != nil {
+			return fmt.Errorf("SO_REUSEPORT failed: %w", optionErr)
+		}
+		if control != nil {
+			return control(network, address, c)
+		}
+		return nil
+	}
+	return lc
 }
 
 //go:linkname sendto golang.org/x/sys/unix.sendto
@@ -217,6 +223,18 @@ func (u *StdConn) Rebind() error {
 	} else {
 		err = syscall.SetsockoptInt(int(u.sysFd), syscall.IPPROTO_IPV6, syscall.IPV6_BOUND_IF, 0)
 	}
+	if err != nil || u.listenConfig == nil {
+		return err
+	}
 
-	return err
+	var lc net.ListenConfig
+	u.listenConfig(&lc)
+	if lc.Control == nil {
+		return nil
+	}
+	rc, err := u.UDPConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return lc.Control("udp", u.UDPConn.LocalAddr().String(), rc)
 }

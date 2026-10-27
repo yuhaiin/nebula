@@ -3,12 +3,14 @@
 package udp
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -31,9 +33,15 @@ type StdConn struct {
 	bw *batchWriter
 
 	groSupported bool
+	// file owns the descriptor obtained from net.ListenConfig, when provided.
+	// Without a custom listener configuration Nebula keeps its native socket.
+	file *os.File
 }
 
 func NewListener(l *slog.Logger, s Settings) (Conn, error) {
+	if s.ListenConfig != nil {
+		return newConfiguredListener(l, s)
+	}
 	af := unix.AF_INET6
 	if s.Listen.Addr().Is4() {
 		af = unix.AF_INET
@@ -71,8 +79,59 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 		return nil, fmt.Errorf("unable to bind to socket: %w", err)
 	}
 
-	out := &StdConn{sysFd: fd, isV4: s.Listen.Addr().Is4(), l: l, batch: s.Batch}
+	return newStdConn(l, s, fd, nil), nil
+}
 
+// newConfiguredListener applies the caller's net.ListenConfig to socket
+// creation. We duplicate the resulting descriptor and retain Nebula's native
+// recvmmsg/sendmmsg data paths, including GSO/GRO and batch processing.
+func newConfiguredListener(l *slog.Logger, s Settings) (Conn, error) {
+	var lc net.ListenConfig
+	s.ListenConfig(&lc)
+	if s.Multi {
+		// Nebula needs SO_REUSEPORT for multiple listening routines even
+		// when the embedder supplies a custom listen configuration.
+		control := lc.Control
+		lc.Control = func(network, address string, c syscall.RawConn) error {
+			var optionErr error
+			if err := c.Control(func(fd uintptr) {
+				optionErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+			if optionErr != nil {
+				return fmt.Errorf("unable to set SO_REUSEPORT: %w", optionErr)
+			}
+			if control != nil {
+				return control(network, address, c)
+			}
+			return nil
+		}
+	}
+
+	pc, err := lc.ListenPacket(context.Background(), "udp", s.Listen.String())
+	if err != nil {
+		return nil, fmt.Errorf("unable to open configured UDP listener: %w", err)
+	}
+	uc, ok := pc.(*net.UDPConn)
+	if !ok {
+		_ = pc.Close()
+		return nil, fmt.Errorf("unexpected configured UDP listener: %T", pc)
+	}
+	file, err := uc.File()
+	closeErr := uc.Close()
+	if err != nil {
+		return nil, fmt.Errorf("unable to duplicate configured UDP listener: %w", err)
+	}
+	if closeErr != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("unable to close original configured UDP listener: %w", closeErr)
+	}
+	return newStdConn(l, s, int(file.Fd()), file), nil
+}
+
+func newStdConn(l *slog.Logger, s Settings, fd int, file *os.File) *StdConn {
+	out := &StdConn{sysFd: fd, isV4: s.Listen.Addr().Is4(), l: l, batch: s.Batch, file: file}
 	out.bw = newBatchWriter(fd, out.isV4, l, s.Offloads)
 
 	// GRO coalesces same-flow datagrams into superpackets that must be split back apart via the delivered gso_size cmsg
@@ -80,8 +139,7 @@ func NewListener(l *slog.Logger, s Settings) (Conn, error) {
 	if s.Batch > 1 && s.Offloads {
 		out.prepareGRO()
 	}
-
-	return out, nil
+	return out
 }
 
 // udpGROBufferSize sizes the per-entry recvmmsg buffer when UDP_GRO is on.
@@ -449,18 +507,22 @@ func (u *StdConn) ReloadConfig(c *config.C, r *config.Reload) {
 		}
 	}
 
-	b = c.GetInt("listen.so_mark", 0)
-	s, err := u.GetSoMark()
-	if b > 0 || (err == nil && s != 0) {
-		if err := u.SetSoMark(b); err == nil {
-			if s, err := u.GetSoMark(); err == nil {
-				u.l.Info("listen.so_mark was set", "mark", s)
+	// Preserve a mark supplied by ListenConfig.Control if the Nebula config
+	// does not explicitly set listen.so_mark. A configured mark takes priority.
+	if u.file == nil || c.IsSet("listen.so_mark") {
+		b = c.GetInt("listen.so_mark", 0)
+		s, err := u.GetSoMark()
+		if b > 0 || (err == nil && s != 0) {
+			if err := u.SetSoMark(b); err == nil {
+				if s, err := u.GetSoMark(); err == nil {
+					u.l.Info("listen.so_mark was set", "mark", s)
+				} else {
+					u.l.Warn("Failed to get listen.so_mark", "error", err)
+				}
 			} else {
-				u.l.Warn("Failed to get listen.so_mark", "error", err)
+				u.l.Error("Failed to set listen.so_mark", "error", err)
+				r.Failed()
 			}
-		} else {
-			u.l.Error("Failed to set listen.so_mark", "error", err)
-			r.Failed()
 		}
 	}
 }
@@ -484,6 +546,9 @@ func (u *StdConn) Shutdown() error {
 
 func (u *StdConn) Close() error {
 	_ = u.Shutdown()
+	if u.file != nil {
+		return u.file.Close()
+	}
 	return unix.Close(u.sysFd)
 }
 

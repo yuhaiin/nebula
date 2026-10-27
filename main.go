@@ -31,7 +31,23 @@ const maxRoutines = 1 << 16
 // The reject headroom must exceed every sender that can be mid-reservation at once, about two per routine.
 const _ = noiseutil.RejectHeadroom - 4*maxRoutines
 
+// MainOptions configures optional hooks for embedding Nebula.
+// The zero value preserves the behavior of Main.
+type MainOptions struct {
+	// UDPListenConfig customizes the underlay UDP listener using Go's standard
+	// net.ListenConfig API. It is applied independently to every UDP listener,
+	// including listeners serving lighthouse and relay traffic.
+	// The callback may run concurrently for multiple listening routines.
+	UDPListenConfig func(*net.ListenConfig)
+}
+
+// Main starts Nebula with its default UDP listener configuration.
 func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, deviceFactory overlay.DeviceFactory) (retcon *Control, reterr error) {
+	return MainWithOptions(c, configTest, buildVersion, l, deviceFactory, MainOptions{})
+}
+
+// MainWithOptions starts Nebula with optional per-instance embedding hooks.
+func MainWithOptions(c *config.C, configTest bool, buildVersion string, l *slog.Logger, deviceFactory overlay.DeviceFactory, options MainOptions) (retcon *Control, reterr error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	// The goroutines started below stop only when this context does, and only a caller holding the
 	// Control can arrange that. Cancel whenever we are not handing one back, which covers an error
@@ -193,10 +209,11 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 				l.Warn("listen.batch size is invalid", "provided", oldBatch, "overridden to", batchSize)
 			}
 			udpSettings := udp.Settings{
-				Listen:   listen,
-				Multi:    routines > 1,
-				Batch:    batchSize,
-				Offloads: c.GetBool("listen.udp_offloads", false),
+				Listen:       listen,
+				Multi:        routines > 1,
+				Batch:        batchSize,
+				Offloads:     c.GetBool("listen.udp_offloads", false),
+				ListenConfig: options.UDPListenConfig,
 			}
 			udpServer, err := udp.NewListener(l, udpSettings)
 			if err != nil {

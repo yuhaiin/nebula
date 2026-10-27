@@ -1,6 +1,7 @@
 package udp
 
 import (
+	"net"
 	"net/netip"
 
 	"github.com/slackhq/nebula/config"
@@ -24,6 +25,10 @@ type Settings struct {
 	Multi    bool
 	Batch    int
 	Offloads bool
+
+	// ListenConfig optionally configures the underlay UDP socket before bind.
+	// Returning an error from Control aborts listener creation.
+	ListenConfig func(*net.ListenConfig)
 }
 
 type Conn interface {
